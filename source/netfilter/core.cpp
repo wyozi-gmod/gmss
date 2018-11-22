@@ -3,6 +3,7 @@
 #include <main.hpp>
 #include <GarrysMod/Lua/Interface.h>
 #include <GarrysMod/Interfaces.hpp>
+#include <GarrysMod/LuaHelpers.hpp>
 #include <stdint.h>
 #include <stddef.h>
 #include <queue>
@@ -142,7 +143,8 @@ namespace netfilter
 	{
 		PacketTypeInvalid = -1,
 		PacketTypeGood,
-		PacketTypeInfo
+		PacketTypeInfo,
+		PacketTypePlayer
 	};
 
 	class CSteamGameServerAPIContext
@@ -245,6 +247,9 @@ namespace netfilter
 	static uint32_t info_cache_last_update = 0;
 	static uint32_t info_cache_time = 5;
 
+	static char player_cache_buffer[1024] = { 0 };
+	static bf_write player_cache_packet(player_cache_buffer, sizeof(player_cache_buffer));
+
 	static ClientManager client_manager;
 
 	static const size_t packet_sampling_max_queue = 50;
@@ -256,6 +261,8 @@ namespace netfilter
 	static IServerGameDLL *gamedll = nullptr;
 	static IVEngineServer *engine_server = nullptr;
 	static IFileSystem *filesystem = nullptr;
+
+	static GarrysMod::Lua::ILuaInterface *lua_interface = nullptr;
 
 	static void BuildStaticReplyInfo( )
 	{
@@ -316,29 +323,98 @@ namespace netfilter
 		}
 	}
 
+	static const char info_hook_name[] = "ReplyInfo";
+
 	// maybe divide into low priority and high priority data?
 	// low priority would be VAC protection status for example
 	// updated on a much bigger period
-	static void BuildReplyInfo( )
+	static void BuildReplyInfo( const sockaddr_in &from )
 	{
 		info_cache_packet.Reset( );
+
+		const char* server_name = global::server->GetName();
+		const char* map_name = global::server->GetMapName();
+		int num_clients = global::server->GetNumClients();
+
+		const char* game_dir = reply_info.game_dir.c_str();
+		const char* game_desc = reply_info.game_desc.c_str();
+
+		int32_t maxplayers =
+			sv_visiblemaxplayers != nullptr ? sv_visiblemaxplayers->GetInt() : -1;
+		if (maxplayers <= 0 || maxplayers > reply_info.max_clients)
+			maxplayers = reply_info.max_clients;
+
+		if (LuaHelpers::PushHookRun(lua_interface, info_hook_name)) {
+
+			lua_interface->CreateTable();
+
+#define PUSH_STR(str, value) lua_interface->PushString(str); lua_interface->PushString(value); lua_interface->SetTable(-3);
+
+			PUSH_STR("QueryAddr", inet_ntoa(from.sin_addr));
+			PUSH_STR("ServerName", server_name);
+			PUSH_STR("MapName", map_name);
+			PUSH_STR("GameDir", game_dir);
+			PUSH_STR("GameDesc", game_desc);
+			lua_interface->PushString("PlayerCount"); lua_interface->PushNumber(num_clients); lua_interface->SetTable(-3);
+			lua_interface->PushString("MaxPlayers"); lua_interface->PushNumber(maxplayers); lua_interface->SetTable(-3);
+
+			if (LuaHelpers::CallHookRun(lua_interface, 1, 1))
+			{
+				if (lua_interface->IsType(-1, GarrysMod::Lua::Type::TABLE)) {
+					lua_interface->PushString("ServerName"); lua_interface->GetTable(-2);
+					if (lua_interface->IsType(-1, GarrysMod::Lua::Type::STRING)) {
+						server_name = lua_interface->GetString(-1);
+					}
+					lua_interface->Remove(2);
+
+					lua_interface->PushString("MapName"); lua_interface->GetTable(-2);
+					if (lua_interface->IsType(-1, GarrysMod::Lua::Type::STRING)) {
+						map_name = lua_interface->GetString(-1);
+					}
+					lua_interface->Remove(2);
+
+					lua_interface->PushString("GameDir"); lua_interface->GetTable(-2);
+					if (lua_interface->IsType(-1, GarrysMod::Lua::Type::STRING)) {
+						game_dir = lua_interface->GetString(-1);
+					}
+					lua_interface->Remove(2);
+
+					lua_interface->PushString("GameDesc"); lua_interface->GetTable(-2);
+					if (lua_interface->IsType(-1, GarrysMod::Lua::Type::STRING)) {
+						game_desc = lua_interface->GetString(-1);
+					}
+					lua_interface->Remove(2);
+
+					lua_interface->PushString("PlayerCount"); lua_interface->GetTable(-2);
+					if (lua_interface->IsType(-1, GarrysMod::Lua::Type::NUMBER)) {
+						num_clients = (int) lua_interface->GetNumber(-1);
+					}
+					lua_interface->Remove(2);
+
+					lua_interface->PushString("MaxPlayers"); lua_interface->GetTable(-2);
+					if (lua_interface->IsType(-1, GarrysMod::Lua::Type::NUMBER)) {
+						maxplayers = (int)lua_interface->GetNumber(-1);
+					}
+					lua_interface->Remove(2);
+				}
+
+				lua_interface->Pop(1);
+			}
+
+		}
 
 		info_cache_packet.WriteLong( -1 ); // connectionless packet header
 		info_cache_packet.WriteByte( 'I' ); // packet type is always 'I'
 		info_cache_packet.WriteByte( default_proto_version );
-		info_cache_packet.WriteString( global::server->GetName( ) );
-		info_cache_packet.WriteString( global::server->GetMapName( ) );
-		info_cache_packet.WriteString( reply_info.game_dir.c_str( ) );
-		info_cache_packet.WriteString( reply_info.game_desc.c_str( ) );
+		info_cache_packet.WriteString( server_name );
+		info_cache_packet.WriteString( map_name );
+		info_cache_packet.WriteString( game_dir );
+		info_cache_packet.WriteString( game_desc );
 
 		int32_t appid = engine_server->GetAppID( );
 		info_cache_packet.WriteShort( appid );
 
-		info_cache_packet.WriteByte( global::server->GetNumClients( ) );
-		int32_t maxplayers =
-			sv_visiblemaxplayers != nullptr ? sv_visiblemaxplayers->GetInt( ) : -1;
-		if( maxplayers <= 0 || maxplayers > reply_info.max_clients )
-			maxplayers = reply_info.max_clients;
+		info_cache_packet.WriteByte( num_clients );
 		info_cache_packet.WriteByte( maxplayers );
 		info_cache_packet.WriteByte( global::server->GetNumFakeClients( ) );
 		info_cache_packet.WriteByte( 'd' ); // dedicated server identifier
@@ -370,11 +446,7 @@ namespace netfilter
 
 	inline PacketType SendInfoCache( const sockaddr_in &from, uint32_t time )
 	{
-		if( time - info_cache_last_update >= info_cache_time )
-		{
-			BuildReplyInfo( );
-			info_cache_last_update = time;
-		}
+		BuildReplyInfo( from );
 
 		sendto(
 			game_socket,
@@ -391,13 +463,152 @@ namespace netfilter
 	inline PacketType HandleInfoQuery( const sockaddr_in &from )
 	{
 		uint32_t time = static_cast<uint32_t>( globalvars->realtime );
-		if( !client_manager.CheckIPRate( from.sin_addr.s_addr, time ) )
-			return PacketTypeInvalid;
+		return SendInfoCache( from, time );
+	}
 
-		if( info_cache_enabled )
-			return SendInfoCache( from, time );
+	struct player_t
+	{
+		byte index;
+		std::string name;
+		double score;
+		double time;
 
-		return PacketTypeGood;
+	};
+
+	struct reply_player_t
+	{
+		bool dontsend;
+		bool senddefault;
+
+		byte count;
+		std::vector<player_t> players;
+	};
+
+	inline void BuildReplyPlayerPacket(reply_player_t r_player)
+	{
+		player_cache_packet.Reset();
+
+		player_cache_packet.WriteLong(-1); // connectionless packet header
+		player_cache_packet.WriteByte('D'); // packet type is always 'I'
+
+		player_cache_packet.WriteByte(r_player.count);
+		for (int i = 0; i < r_player.count; i++)
+		{
+			player_t player = r_player.players[i];
+			player_cache_packet.WriteByte(i);
+			player_cache_packet.WriteString(player.name.c_str());
+			player_cache_packet.WriteLong(player.score);
+			player_cache_packet.WriteFloat(player.time);
+		}
+
+	}
+
+	inline reply_player_t CallPlayerHook(const sockaddr_in &from)
+	{
+		const auto lua = lua_interface;
+
+		reply_player_t newreply;
+		newreply.dontsend = false;
+		newreply.senddefault = true;
+
+
+		char hook[] = "A2S_PLAYER";
+
+		lua->GetField(GarrysMod::Lua::INDEX_GLOBAL, "hook");
+		if (!lua->IsType(-1, GarrysMod::Lua::Type::TABLE))
+		{
+			lua->ErrorNoHalt("[%s] Global hook is not a table!\n", hook);
+			lua->Pop(2);
+			return newreply;
+		}
+
+		lua->GetField(-1, "Run");
+		lua->Remove(-2);
+		if (!lua->IsType(-1, GarrysMod::Lua::Type::FUNCTION))
+		{
+			lua->ErrorNoHalt("[%s] Global hook.Run is not a function!\n", hook);
+			lua->Pop(2);
+			return newreply;
+		}
+
+		lua->PushString(hook);
+		lua->PushString(inet_ntoa(from.sin_addr));
+		lua->PushNumber(27015);
+
+		if (lua->PCall(3, 1, 0) != 0)
+			lua->ErrorNoHalt("\n[%s] %s\n\n", hook, lua->GetString(-1));
+
+		if (lua->IsType(-1, GarrysMod::Lua::Type::BOOL))
+		{
+			if (!lua->GetBool(-1))
+			{
+				newreply.senddefault = false;
+				newreply.dontsend = true; // dont send when return false
+			}
+		}
+		else if (lua->IsType(-1, GarrysMod::Lua::Type::TABLE))
+		{
+			newreply.senddefault = false;
+
+			int count = lua->ObjLen(-1);
+			newreply.count = count;
+
+			std::vector<player_t> newPlayers(count);
+
+			for (int i = 0; i < count; i++)
+			{
+				player_t newPlayer;
+				newPlayer.index = i;
+
+				lua->PushNumber(i + 1);
+				lua->GetTable(-2);
+
+				lua->GetField(-1, "name");
+				newPlayer.name = lua->GetString(-1);
+				lua->Pop(1);
+
+				lua->GetField(-1, "score");
+				newPlayer.score = lua->GetNumber(-1);
+				lua->Pop(1);
+
+				lua->GetField(-1, "time");
+				newPlayer.time = lua->GetNumber(-1);
+				lua->Pop(1);
+
+				lua->Pop(1);
+				newPlayers.at(i) = newPlayer;
+			}
+
+			newreply.players = newPlayers;
+		}
+
+		lua->Pop(1);
+
+		return newreply;
+	}
+
+	inline PacketType HandlePlayerQuery(const sockaddr_in &from)
+	{
+		reply_player_t player = CallPlayerHook(from);
+
+		if (player.senddefault)
+			return PacketTypeGood;
+
+		if (player.dontsend)
+			return PacketTypeInvalid; // dont senkd it
+
+		BuildReplyPlayerPacket(player);
+
+		sendto(
+			game_socket,
+			reinterpret_cast<char *>(player_cache_packet.GetData()),
+			player_cache_packet.GetNumBytesWritten(),
+			0,
+			reinterpret_cast<const sockaddr *>(&from),
+			sizeof(from)
+		);
+		//DebugWarning("uhhh: ", );
+		return PacketTypeInvalid; // we've handled it
 	}
 
 	inline const char *IPToString( const in_addr &addr )
@@ -504,7 +715,11 @@ namespace netfilter
 			return PacketTypeInvalid;
 		}
 
-		return type == 'T' ? PacketTypeInfo : PacketTypeGood;
+		if (type == 'T')
+			return PacketTypeInfo;
+		if (type == 'U')
+			return PacketTypePlayer;
+		return PacketTypeGood;
 	}
 
 	inline bool IsAddressAllowed( const sockaddr_in &addr )
@@ -582,6 +797,9 @@ namespace netfilter
 		PacketType type = ClassifyPacket( buf, len, infrom );
 		if( type == PacketTypeInfo )
 			type = HandleInfoQuery( infrom );
+
+		if (type == PacketTypePlayer)
+			type = HandlePlayerQuery(infrom);
 
 		if( type == PacketTypeInvalid )
 			return -1;
@@ -783,13 +1001,6 @@ namespace netfilter
 		return 0;
 	}
 
-	LUA_FUNCTION_STATIC( RefreshInfoCache )
-	{
-		BuildStaticReplyInfo( );
-		BuildReplyInfo( );
-		return 0;
-	}
-
 	LUA_FUNCTION_STATIC( EnableQueryLimiter )
 	{
 		LUA->CheckType( 1, GarrysMod::Lua::Type::BOOL );
@@ -860,6 +1071,8 @@ namespace netfilter
 
 	void Initialize( GarrysMod::Lua::ILuaBase *LUA )
 	{
+		lua_interface = static_cast<GarrysMod::Lua::ILuaInterface *>(LUA);
+
 		if( !server_loader.IsValid( ) )
 			LUA->ThrowError( "unable to get server factory" );
 
@@ -981,63 +1194,10 @@ namespace netfilter
 			LUA->ThrowError( "unable to create thread" );
 
 		BuildStaticReplyInfo( );
+		SetReceiveDetourStatus(true);
 
-		LUA->PushCFunction( EnableFirewallWhitelist );
-		LUA->SetField( -2, "EnableFirewallWhitelist" );
-
-		LUA->PushCFunction( AddWhitelistIP );
-		LUA->SetField( -2, "AddWhitelistIP" );
-
-		LUA->PushCFunction( RemoveWhitelistIP );
-		LUA->SetField( -2, "RemoveWhitelistIP" );
-
-		LUA->PushCFunction( ResetWhitelist );
-		LUA->SetField( -2, "ResetWhitelist" );
-
-		LUA->PushCFunction( EnableFirewallBlacklist );
-		LUA->SetField( -2, "EnableFirewallBlacklist" );
-
-		LUA->PushCFunction( AddBlacklistIP );
-		LUA->SetField( -2, "AddBlacklistIP" );
-
-		LUA->PushCFunction( RemoveBlacklistIP );
-		LUA->SetField( -2, "RemoveBlacklistIP" );
-
-		LUA->PushCFunction( ResetBlacklist );
-		LUA->SetField( -2, "ResetBlacklist" );
-
-		LUA->PushCFunction( EnablePacketValidation );
-		LUA->SetField( -2, "EnablePacketValidation" );
-
-		LUA->PushCFunction( EnableThreadedSocket );
-		LUA->SetField( -2, "EnableThreadedSocket" );
-
-		LUA->PushCFunction( EnableInfoCache );
-		LUA->SetField( -2, "EnableInfoCache" );
-
-		LUA->PushCFunction( SetInfoCacheTime );
-		LUA->SetField( -2, "SetInfoCacheTime" );
-
-		LUA->PushCFunction( RefreshInfoCache );
-		LUA->SetField( -2, "RefreshInfoCache" );
-
-		LUA->PushCFunction( EnableQueryLimiter );
-		LUA->SetField( -2, "EnableQueryLimiter" );
-
-		LUA->PushCFunction( SetMaxQueriesWindow );
-		LUA->SetField( -2, "SetMaxQueriesWindow" );
-
-		LUA->PushCFunction( SetMaxQueriesPerSecond );
-		LUA->SetField( -2, "SetMaxQueriesPerSecond" );
-
-		LUA->PushCFunction( SetGlobalMaxQueriesPerSecond );
-		LUA->SetField( -2, "SetGlobalMaxQueriesPerSecond" );
-
-		LUA->PushCFunction( EnablePacketSampling );
-		LUA->SetField( -2, "EnablePacketSampling" );
-
-		LUA->PushCFunction( GetSamplePacket );
-		LUA->SetField( -2, "GetSamplePacket" );
+		//LUA->PushCFunction( EnableFirewallWhitelist );
+		//LUA->SetField( -2, "EnableFirewallWhitelist" );
 	}
 
 	void Deinitialize( GarrysMod::Lua::ILuaBase * )

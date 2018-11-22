@@ -60,20 +60,17 @@ namespace global
 			LUA->ThrowError( "failed to locate IServer" );
 
 		LUA->CreateTable( );
-
-		LUA->PushCFunction( GetClientCount );
-		LUA->SetField( -2, "GetClientCount" );
 	}
 
 	static void Initialize( GarrysMod::Lua::ILuaBase *LUA )
 	{
-		LUA->SetField( GarrysMod::Lua::INDEX_GLOBAL, "serversecure" );
+		LUA->SetField( GarrysMod::Lua::INDEX_GLOBAL, "queryover" );
 	}
 
 	static void Deinitialize( GarrysMod::Lua::ILuaBase *LUA )
 	{
 		LUA->PushNil( );
-		LUA->SetField( GarrysMod::Lua::INDEX_GLOBAL, "serversecure" );
+		LUA->SetField( GarrysMod::Lua::INDEX_GLOBAL, "queryover" );
 	}
 }
 
@@ -81,14 +78,12 @@ GMOD_MODULE_OPEN( )
 {
 	global::PreInitialize( LUA );
 	netfilter::Initialize( LUA );
-	filecheck::Initialize( LUA );
 	global::Initialize( LUA );
 	return 1;
 }
 
 GMOD_MODULE_CLOSE( )
 {
-	filecheck::Deinitialize( LUA );
 	netfilter::Deinitialize( LUA );
 	global::Deinitialize( LUA );
 	return 0;
